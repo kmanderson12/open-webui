@@ -12,6 +12,10 @@ elif VECTOR_DB == "opensearch":
     from open_webui.retrieval.vector.dbs.opensearch import OpenSearchClient
 
     VECTOR_DB_CLIENT = OpenSearchClient()
+elif VECTOR_DB == "opensearch_serverless":
+    from open_webui.retrieval.vector.dbs.opensearch_serverless import OpenSearchServerlessClient
+
+    VECTOR_DB_CLIENT = OpenSearchServerlessClient()
 elif VECTOR_DB == "pgvector":
     from open_webui.retrieval.vector.dbs.pgvector import PgvectorClient
 
