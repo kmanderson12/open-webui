@@ -1,6 +1,5 @@
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 import boto3
-from opensearchpy.helpers import bulk
 from typing import Optional
 import logging
 import time
@@ -11,6 +10,7 @@ from open_webui.config import (
     OPENSEARCH_SERVERLESS_HOST,
     OPENSEARCH_SERVERLESS_PORT,
     OPENSEARCH_SERVERLESS_SERVICE_NAME,
+    OPENSEARCH_SERVERLESS_INDEX_CREATION_DELAY
 )
 
 # Set up logging
@@ -46,17 +46,12 @@ class OpenSearchServerlessClient:
             timeout=30
         )
 
-        # Use a real in-memory cache for ID mappings
-        self.id_mapping_cache = {}  # collection_name -> {original_id -> opensearch_id}
-
         # Test the connection
         try:
-            info = self.client.info()
-            logger.info(f"Successfully connected to OpenSearch Serverless. Cluster: {info.get('cluster_name', 'unknown')}, Version: {info.get('version', {}).get('number', 'unknown')}")
+            indices = self.client.indices.get("*")  # Get all indices
+            logger.info(f"Successfully connected to OpenSearch Serverless. Found {len(indices)} indices.")
         except Exception as e:
             logger.error(f"Failed to connect to OpenSearch Serverless: {str(e)}")
-            # You can choose to raise the exception or continue
-            # raise  # Uncomment if you want to fail fast when connection fails
 
     def _get_index_name(self, collection_name: str) -> str:
         return f"{self.index_prefix}_{collection_name}"
@@ -137,101 +132,30 @@ class OpenSearchServerlessClient:
             logger.error(f"Error creating index {self._get_index_name(collection_name)}: {str(e)}")
             raise
 
-    def _create_batches(self, items: list[VectorItem], batch_size=100):
-        for i in range(0, len(items), batch_size):
-            yield items[i : i + batch_size]
-
-    def _get_opensearch_id(self, collection_name: str, original_id: str) -> Optional[str]:
-        """Get OpenSearch ID for an original ID with caching."""
-        # Check cache first
-        if (collection_name in self.id_mapping_cache and
-                original_id in self.id_mapping_cache[collection_name]):
-            return self.id_mapping_cache[collection_name][original_id]
-
-        # Cache miss - query OpenSearch
+    def _get_opensearch_id_for_original_id(self, collection_name: str, original_id: str, timeout: int = 30) -> Optional[str]:
+        """Get OpenSearch ID for an original ID."""
         query = {
             "query": {"term": {"original_id": original_id}},
-            "_source": False  # We only need the ID, not the source
+            "_source": False
         }
 
         try:
             result = self.client.search(
                 index=self._get_index_name(collection_name),
                 body=query,
-                size=1
+                size=1,
+                request_timeout=timeout
             )
 
             if result["hits"]["hits"]:
-                opensearch_id = result["hits"]["hits"][0]["_id"]
-                # Update cache
-                if collection_name not in self.id_mapping_cache:
-                    self.id_mapping_cache[collection_name] = {}
-                self.id_mapping_cache[collection_name][original_id] = opensearch_id
-                return opensearch_id
+                return result["hits"]["hits"][0]["_id"]
+            else:
+                logger.warning(f"No document found with original_id: {original_id}")
+                return None
+
         except Exception as e:
             logger.error(f"Error getting OpenSearch ID for {original_id}: {str(e)}")
-
-        return None
-
-    def _batch_get_opensearch_ids(self, collection_name: str, original_ids: list[str]) -> dict:
-        """Get OpenSearch IDs for multiple original IDs in one query."""
-        if not original_ids:
-            return {}
-
-        # Check cache first
-        result = {}
-        missing_ids = []
-
-        if collection_name in self.id_mapping_cache:
-            cache = self.id_mapping_cache[collection_name]
-            for orig_id in original_ids:
-                if orig_id in cache:
-                    result[orig_id] = cache[orig_id]
-                else:
-                    missing_ids.append(orig_id)
-        else:
-            self.id_mapping_cache[collection_name] = {}
-            missing_ids = original_ids
-
-        # If all IDs were in cache, return immediately
-        if not missing_ids:
-            return result
-
-        # Query for missing IDs
-        query = {
-            "query": {
-                "terms": {
-                    "original_id": missing_ids
-                }
-            },
-            "_source": ["original_id"],
-            "size": len(missing_ids)
-        }
-
-        try:
-            search_result = self.client.search(
-                index=self._get_index_name(collection_name),
-                body=query
-            )
-
-            # Update cache and result
-            for hit in search_result["hits"]["hits"]:
-                orig_id = hit["_source"]["original_id"]
-                os_id = hit["_id"]
-                self.id_mapping_cache[collection_name][orig_id] = os_id
-                result[orig_id] = os_id
-        except Exception as e:
-            logger.error(f"Error batch getting OpenSearch IDs: {str(e)}")
-
-        return result
-
-    def _invalidate_id_cache(self, collection_name: str, original_id: str = None):
-        """Invalidate the ID mapping cache for a collection or specific ID."""
-        if original_id and collection_name in self.id_mapping_cache:
-            if original_id in self.id_mapping_cache[collection_name]:
-                del self.id_mapping_cache[collection_name][original_id]
-        elif collection_name in self.id_mapping_cache:
-            del self.id_mapping_cache[collection_name]
+            return None
 
     def has_collection(self, collection_name: str) -> bool:
         try:
@@ -243,8 +167,6 @@ class OpenSearchServerlessClient:
     def delete_collection(self, collection_name: str):
         try:
             self.client.indices.delete(index=self._get_index_name(collection_name))
-            # Clear cache for this collection
-            self._invalidate_id_cache(collection_name)
             logger.info(f"Deleted index {self._get_index_name(collection_name)}")
         except Exception as e:
             logger.error(f"Error deleting collection {collection_name}: {str(e)}")
@@ -305,7 +227,7 @@ class OpenSearchServerlessClient:
                 {"match": {"metadata." + str(field): value}}
             )
 
-        size = limit if limit else 10
+        size = limit if limit else 10000 # Increase size to account for large files
 
         try:
             result = self.client.search(
@@ -320,9 +242,10 @@ class OpenSearchServerlessClient:
             logger.error(f"Error querying collection {collection_name}: {str(e)}")
             return None
 
-    def _create_index_if_not_exists(self, collection_name: str, dimension: int):
+    def _create_index_if_not_exists(self, collection_name: str, dimension: int, delay: float = 0):
         if not self.has_collection(collection_name):
             self._create_index(collection_name, dimension)
+            time.sleep(delay) # Optional delay to avoid race conditions
 
     def get(self, collection_name: str) -> Optional[GetResult]:
         try:
@@ -338,76 +261,69 @@ class OpenSearchServerlessClient:
 
     def insert(self, collection_name: str, items: list[VectorItem]):
         try:
-            self._create_index_if_not_exists(
-                collection_name=collection_name, dimension=len(items[0]["vector"])
-            )
+            # Ensure the index exists
+            if items:
+                self._create_index_if_not_exists(
+                    collection_name=collection_name, dimension=len(items[0]["vector"]), delay=OPENSEARCH_SERVERLESS_INDEX_CREATION_DELAY
+                )
 
-            for batch in self._create_batches(items):
-                actions = [
-                    {
-                        "_op_type": "index",
-                        "_index": self._get_index_name(collection_name),
-                        # No _id field - let OpenSearch generate it
-                        "_source": {
-                            "original_id": item["id"],  # Store our ID in the document
+                # Process items individually for clarity
+                for item in items:
+                    self.client.index(
+                        index=self._get_index_name(collection_name),
+                        body={
+                            "original_id": item["id"],
                             "vector": item["vector"],
                             "text": item["text"],
                             "metadata": item["metadata"],
-                        },
-                    }
-                    for item in batch
-                ]
-                bulk(self.client, actions)
-                logger.info(f"Inserted batch of {len(batch)} items into {collection_name}")
+                        }
+                    )
+                    logger.info(f"Inserted item with ID {item['id']} into {collection_name}")
+            else:
+                logger.warning("No items to insert")
+
         except Exception as e:
             logger.error(f"Error inserting into collection {collection_name}: {str(e)}")
             raise
 
     def upsert(self, collection_name: str, items: list[VectorItem]):
         try:
-            self._create_index_if_not_exists(
-                collection_name=collection_name, dimension=len(items[0]["vector"])
-            )
-
-            # Split items into two categories: new items and updates
-            # First, query all original_ids in bulk
-            original_ids = [item["id"] for item in items]
-            existing_ids_map = self._batch_get_opensearch_ids(collection_name, original_ids)
-
-            # Prepare bulk actions for both new and existing items
-            actions = []
-
+            # Process each item individually for clarity
             for item in items:
-                opensearch_id = existing_ids_map.get(item["id"])
+                # Check if the item exists
+                opensearch_id = self._get_opensearch_id_for_original_id(collection_name, item["id"])
+
                 if opensearch_id:
-                    # Update
-                    actions.append({
-                        "_op_type": "update",
-                        "_index": self._get_index_name(collection_name),
-                        "_id": opensearch_id,
-                        "doc": {
-                            "vector": item["vector"],
-                            "text": item["text"],
-                            "metadata": item["metadata"],
+                    # Item exists - update it
+                    logger.info(f"Updating existing item with ID {item['id']} (OpenSearch ID: {opensearch_id})")
+                    self.client.update(
+                        index=self._get_index_name(collection_name),
+                        id=opensearch_id,
+                        body={
+                            "doc": {
+                                "vector": item["vector"],
+                                "text": item["text"],
+                                "metadata": item["metadata"],
+                            }
                         }
-                    })
+                    )
                 else:
-                    # Insert
-                    actions.append({
-                        "_op_type": "index",
-                        "_index": self._get_index_name(collection_name),
-                        "_source": {
+                    # Item doesn't exist - create the index if needed
+                    if not self.has_collection(collection_name):
+                        self._create_index(collection_name, dimension=len(item["vector"]))
+
+                    # Insert new item
+                    logger.info(f"Inserting new item with ID {item['id']}")
+                    self.client.index(
+                        index=self._get_index_name(collection_name),
+                        body={
                             "original_id": item["id"],
                             "vector": item["vector"],
                             "text": item["text"],
                             "metadata": item["metadata"],
                         }
-                    })
+                    )
 
-            # Execute bulk operation
-            if actions:
-                bulk(self.client, actions)
-                logger.info(f"Upserted {len(items)} items in {collection_name}")
         except Exception as e:
             logger.error(f"Error upserting in collection {collection_name}: {str(e)}")
             raise
@@ -418,42 +334,156 @@ class OpenSearchServerlessClient:
         ids: Optional[list[str]] = None,
         filter: Optional[dict] = None,
     ):
+        max_documents: int = 10000  # Safety limit for total documents to delete
+        batch_size: int = 100       # Number of documents per batch
+        request_timeout: int = 30   # Timeout for OpenSearch requests in seconds
+        batch_delay: float = 1.0    # Delay between batches in seconds
+
         try:
+            # Check if collection exists
+            if not self.has_collection(collection_name):
+                logger.warning(f"Collection {collection_name} does not exist. Nothing to delete.")
+                return
+
             if ids:
-                # Get all OpenSearch IDs in one query
-                opensearch_ids = []
-                id_mapping = self._batch_get_opensearch_ids(collection_name, ids)
+                # Process each ID individually
+                deleted_count = 0
+                not_found_count = 0
 
-                for original_id, opensearch_id in id_mapping.items():
-                    opensearch_ids.append(opensearch_id)
-                    # Invalidate cache
-                    self._invalidate_id_cache(collection_name, original_id)
-
-                if opensearch_ids:
-                    actions = [
-                        {
-                            "_op_type": "delete",
-                            "_index": self._get_index_name(collection_name),
-                            "_id": os_id,
-                        }
-                        for os_id in opensearch_ids
-                    ]
-                    bulk(self.client, actions)
-                    logger.info(f"Deleted {len(opensearch_ids)} items from {collection_name}")
-            elif filter:
-                query_body = {
-                    "query": {"bool": {"filter": []}},
-                }
-                for field, value in filter.items():
-                    query_body["query"]["bool"]["filter"].append(
-                        {"match": {"metadata." + str(field): value}}
+                for original_id in ids:
+                    # Find the OpenSearch ID
+                    opensearch_id = self._get_opensearch_id_for_original_id(
+                        collection_name,
+                        original_id,
+                        timeout=request_timeout
                     )
-                self.client.delete_by_query(
-                    index=self._get_index_name(collection_name), body=query_body
-                )
-                # After delete, invalidate the entire collection cache
-                self._invalidate_id_cache(collection_name)
-                logger.info(f"Deleted items by filter from {collection_name}")
+
+                    if opensearch_id:
+                        try:
+                            # Delete the document
+                            logger.info(f"Deleting item with ID {original_id} (OpenSearch ID: {opensearch_id})")
+                            self.client.delete(
+                                index=self._get_index_name(collection_name),
+                                id=opensearch_id,
+                                request_timeout=request_timeout
+                            )
+                            deleted_count += 1
+                        except Exception as e:
+                            logger.error(f"Error deleting document {original_id}: {str(e)}")
+                    else:
+                        not_found_count += 1
+                        logger.warning(f"Could not find OpenSearch ID for original_id {original_id} - nothing deleted")
+
+                logger.info(f"ID-based deletion complete: {deleted_count} deleted, {not_found_count} not found")
+
+            elif filter:
+                # Validate filter to prevent accidentally deleting all documents
+                if not filter:
+                    logger.warning("Empty filter provided. This would match all documents. Operation aborted.")
+                    return
+
+                # Since delete_by_query and scroll are not available, we'll use pagination
+                total_deleted = 0
+                max_iterations = (max_documents // batch_size) + 1  # Calculate max iterations based on document limit
+                iteration = 0
+
+                while iteration < max_iterations and total_deleted < max_documents:
+                    iteration += 1
+
+                    # Construct the query to find documents matching the filter
+                    query_body = {
+                        "query": {"bool": {"filter": []}},
+                        "_source": False,  # We only need the IDs
+                        "size": min(batch_size, max_documents - total_deleted)  # Respect max_documents limit
+                    }
+
+                    for field, value in filter.items():
+                        query_body["query"]["bool"]["filter"].append(
+                            {"match": {"metadata." + str(field): value}}
+                        )
+
+                    # Execute search to get documents to delete
+                    logger.info(f"Searching for documents to delete (batch {iteration})")
+                    logger.debug(f"Query: {query_body}")
+
+                    try:
+                        result = self.client.search(
+                            index=self._get_index_name(collection_name),
+                            body=query_body,
+                            request_timeout=request_timeout
+                        )
+                    except Exception as e:
+                        logger.error(f"Error searching for documents to delete: {str(e)}")
+                        break
+
+                    hits = result["hits"]["hits"]
+                    if not hits:
+                        logger.info(f"No more documents found matching the filter. Total deleted: {total_deleted}")
+                        break
+
+                    # Create bulk delete actions
+                    bulk_actions = []
+                    for hit in hits:
+                        bulk_actions.append({
+                            "delete": {
+                                "_index": self._get_index_name(collection_name),
+                                "_id": hit["_id"]
+                            }
+                        })
+
+                    # Execute bulk delete without refresh parameter
+                    if bulk_actions:
+                        try:
+                            bulk_result = self.client.bulk(
+                                body=bulk_actions,
+                                request_timeout=request_timeout
+                                # No refresh=True parameter since it's not supported
+                            )
+
+                            # Detailed error checking for bulk operations
+                            if bulk_result.get("errors", False):
+                                error_items = [
+                                    item for item in bulk_result.get("items", [])
+                                    if item.get("delete", {}).get("status", 200) >= 400
+                                ]
+                                error_count = len(error_items)
+                                if error_count > 0:
+                                    logger.warning(
+                                        f"{error_count} bulk delete operations failed. "
+                                        f"First few errors: {error_items[:3]}"
+                                    )
+
+                            batch_deleted = len(bulk_actions) - (len(error_items) if 'error_items' in locals() else 0)
+                            total_deleted += batch_deleted
+                            logger.info(f"Deleted batch of {batch_deleted} documents, total deleted: {total_deleted}")
+
+                        except Exception as e:
+                            logger.error(f"Error executing bulk delete: {str(e)}")
+                            break
+
+                    # Add a delay between batches since we can't refresh the index
+                    # This gives OpenSearch Serverless time to process the deletions
+                    time.sleep(batch_delay)
+
+                    # If we got fewer documents than the batch size, we're done
+                    if len(hits) < batch_size:
+                        logger.info(f"Completed deletion. Total deleted: {total_deleted}")
+                        break
+
+                    # Safety check for reaching document limit
+                    if total_deleted >= max_documents:
+                        logger.warning(
+                            f"Reached maximum document limit ({max_documents}). "
+                            f"Stopping deletion to prevent excessive operations."
+                        )
+                        break
+
+                if iteration >= max_iterations:
+                    logger.warning(
+                        f"Reached maximum iteration limit ({max_iterations}). "
+                        f"Stopping deletion after {total_deleted} documents."
+                    )
+
         except Exception as e:
             logger.error(f"Error deleting from collection {collection_name}: {str(e)}")
             raise
@@ -462,9 +492,8 @@ class OpenSearchServerlessClient:
         try:
             indices = self.client.indices.get(index=f"{self.index_prefix}_*")
             for index in indices:
+                logger.info(f"Deleting index {index}")
                 self.client.indices.delete(index=index)
-            # Clear all caches
-            self.id_mapping_cache = {}
             logger.info("Reset all collections")
         except Exception as e:
             logger.error(f"Error resetting collections: {str(e)}")
