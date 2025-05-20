@@ -103,7 +103,7 @@
 			</button>
 		</div>
 
-		{#if chat}
+		<!-- {#if chat}
 			<div class="px-5 pt-4 pb-5 w-full flex flex-col justify-center">
 				<div class=" text-sm dark:text-gray-300 mb-1">
 					{#if chat.share_id}
@@ -197,6 +197,25 @@
 					</div>
 				</div>
 			</div>
-		{/if}
+		{/if} -->
+		<div class="px-5 pt-4 pb-5 w-full flex flex-col justify-center">
+			<div class="text-sm dark:text-gray-300 mb-3">
+				{$i18n.t('Chat sharing has been disabled by the application administrator.')}
+			</div>
+
+			<div class="flex justify-end">
+				<div class="flex flex-col items-end space-x-1 mt-3">
+					<button
+						class="self-center flex items-center gap-1 px-3.5 py-2 text-sm font-medium bg-gray-100 hover:bg-gray-200 text-gray-800 dark:bg-gray-850 dark:text-white dark:hover:bg-gray-800 transition rounded-full"
+						type="button"
+						on:click={() => {
+							show = false;
+						}}
+					>
+						{$i18n.t('Close')}
+					</button>
+				</div>
+			</div>
+		</div>
 	</div>
 </Modal>
